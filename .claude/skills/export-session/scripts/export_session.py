@@ -43,6 +43,9 @@ THINKING_HEADER = "✻ Thinking…"  # ✻ Thinking…
 # Transcript location
 # ---------------------------------------------------------------------------
 
+SESSION_ID_RE = re.compile(r"[0-9a-fA-F-]{8,}")
+
+
 def find_transcript(session):
     """Resolve a session id / path / None (current session) to a JSONL path."""
     if session and os.path.isfile(session):
@@ -53,7 +56,10 @@ def find_transcript(session):
             "error: no session given and $CLAUDE_CODE_SESSION_ID is not set. "
             "Pass --session <uuid|path>."
         )
-    matches = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    if not SESSION_ID_RE.fullmatch(session_id):
+        sys.exit(f"error: {session_id!r} is not a session id or an existing transcript path")
+    matches = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*",
+                                     glob.escape(session_id) + ".jsonl"))
     if not matches:
         sys.exit(f"error: no transcript found for session {session_id} under {CLAUDE_PROJECTS_DIR}")
     # If the same session id somehow exists in several project dirs, take newest.
@@ -78,29 +84,35 @@ def load_records(path: str):
     return records
 
 
+def is_main_message(rec):
+    return rec.get("type") in ("user", "assistant") and not rec.get("isSidechain")
+
+
 def conversation_chain(records: list[dict]):
     """Reconstruct the active conversation branch.
 
     Records form a tree via parentUuid (message edits create dead branches).
-    Walk back from the last message record to the root, then reverse.
-    Falls back to file order if the chain looks broken.
+    Walk back from the last main-conversation message to the root, then
+    reverse. Falls back to file order if the chain looks broken.
     """
     by_uuid: dict[str, dict] = {}
-    ordered: list[dict] = []
+    order: list[str] = []
     for r in records:
         uid = r.get("uuid")
-        if uid:
-            if uid not in by_uuid:
-                ordered.append(r)
-            by_uuid[uid] = r
+        if not uid:
+            continue
+        if uid not in by_uuid:
+            order.append(uid)
+        by_uuid[uid] = r  # a re-written uuid keeps its position, newest content
 
-    messages_in_file = [r for r in ordered if r.get("type") in ("user", "assistant")]
+    messages_in_file = [by_uuid[u] for u in order if is_main_message(by_uuid[u])]
     if not messages_in_file:
         return []
 
-    leaf = messages_in_file[-1]
+    # Walk from the last MAIN message: the file's literal last record can be
+    # a subagent sidechain, which belongs to a different branch of the tree.
     chain, seen = [], set()
-    node = leaf
+    node = messages_in_file[-1]
     while node is not None:
         uid = node.get("uuid")
         if uid in seen:
@@ -111,20 +123,22 @@ def conversation_chain(records: list[dict]):
         node = by_uuid.get(parent) if parent else None
     chain.reverse()
 
-    chain_msgs = [r for r in chain if r.get("type") in ("user", "assistant")]
+    chain_msgs = [r for r in chain if is_main_message(r)]
     # If the walk lost more than half the messages, the chain metadata is
     # unreliable (e.g. resumed/compacted sessions) - use file order instead.
     if len(chain_msgs) < len(messages_in_file) // 2:
+        print("warning: conversation chain incomplete; exporting in file order "
+              "(may include edited-away branches)", file=sys.stderr)
         return messages_in_file
     return chain_msgs
 
 
 def is_renderable(rec: dict):
-    if rec.get("type") not in ("user", "assistant"):
-        return False
-    if rec.get("isSidechain"):
+    if not is_main_message(rec):
         return False
     if rec.get("isMeta"):
+        return False
+    if not isinstance(rec.get("message"), dict):
         return False
     return True
 
@@ -133,21 +147,36 @@ def is_renderable(rec: dict):
 # Rendering
 # ---------------------------------------------------------------------------
 
+SYSTEM_TAG_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+CAVEAT_RE = re.compile(r"<local-command-caveat>.*?</local-command-caveat>", re.S)
+COMMAND_RE = re.compile(
+    r"<command-name>(?P<name>.*?)</command-name>\s*"
+    r"(?:<command-message>.*?</command-message>\s*)?"
+    r"(?:<command-args>(?P<args>.*?)</command-args>)?",
+    re.S,
+)
+STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.S)
+
+
 def strip_system_tags(text: str):
-    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S)
-    return text.strip()
+    return SYSTEM_TAG_RE.sub("", text).strip()
 
 
-def command_text(text: str):
-    """Render `<command-name>/foo</command-name>...` blocks as `/foo args`."""
-    name = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
-    if not name:
-        return None
-    args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
-    out = name.group(1).strip()
-    if args and args.group(1).strip():
-        out += " " + args.group(1).strip()
-    return out
+def parse_command(text: str):
+    """Split a slash-command message into (command line or None, remainder).
+
+    Only a message that OPENS with the command tags is a command message;
+    prose that merely quotes the tags must render untouched as prose.
+    """
+    text = CAVEAT_RE.sub("", text)
+    if not text.lstrip().startswith("<command-name>"):
+        return None, text
+    m = COMMAND_RE.search(text)
+    cmd = m.group("name").strip()
+    args = m.group("args")
+    if args and args.strip():
+        cmd += " " + args.strip()
+    return cmd or None, text[:m.start()] + text[m.end():]
 
 
 def prefixed(prefix: str, cont: str, text: str):
@@ -197,7 +226,7 @@ def tool_result_text(block: dict):
     return "\n".join(parts)
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -252,16 +281,17 @@ def render(chain: list[dict], include_thinking: bool, max_result_lines: int):
                 texts = [b.get("text", "") for b in content
                          if isinstance(b, dict) and b.get("type") == "text"]
             for text in texts:
-                stdout = re.search(r"<local-command-stdout>(.*?)</local-command-stdout>", text, re.S)
-                cmd = command_text(text)
-                if cmd is not None:
+                # a command turn can carry a command, its stdout, AND user
+                # prose - render each part, losing none of them
+                cmd, text = parse_command(text)
+                if cmd:
                     blocks.append(prefixed(USER_PREFIX, "  ", cmd))
-                    continue
-                if stdout is not None:
+                stdout = STDOUT_RE.search(text)
+                if stdout is not None and text.lstrip().startswith("<local-command-stdout>"):
                     out = stdout.group(1).strip()
                     if out:
                         blocks.append(render_result(out, max_result_lines))
-                    continue
+                    text = text[:stdout.start()] + text[stdout.end():]
                 text = strip_system_tags(text)
                 if text:
                     blocks.append(prefixed(USER_PREFIX, "  ", text))
@@ -314,11 +344,8 @@ def first_prompt(chain: list[dict]):
                 if isinstance(block, dict) and block.get("type") == "text":
                     text = block.get("text", "").strip()
                     break
-        cmd = command_text(text)
-        if cmd is not None:
-            text = cmd
-        else:
-            text = strip_system_tags(text)
+        cmd, remainder = parse_command(text)
+        text = cmd if cmd else strip_system_tags(remainder)
         text = re.sub(r"\s+", " ", text)
         if not text:
             continue
@@ -404,6 +431,21 @@ def resolve_out(arg_out):
     return os.path.join(out_dir, "")
 
 
+def unique_path(path):
+    """Append -2, -3, ... so auto-named exports never overwrite each other."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{base}-{n}{ext}"):
+        n += 1
+    return f"{base}-{n}{ext}"
+
+
+def is_dir_target(out):
+    return os.path.isdir(out) or out.endswith("/") or out.endswith(os.sep)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--session", help="session uuid or path to a .jsonl transcript "
@@ -415,7 +457,13 @@ def main():
     ap.add_argument("--no-thinking", action="store_true", help="omit thinking blocks")
     ap.add_argument("--max-result-lines", type=int, default=0,
                     help="truncate tool results to N lines (default: 0 = keep all)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing --out file")
     args = ap.parse_args()
+    if args.max_result_lines < 0:
+        ap.error("--max-result-lines must be >= 0")
+    if args.out is not None and not args.out.strip():
+        ap.error("--out must not be empty")
 
     transcript = find_transcript(args.session)
     records = load_records(transcript)
@@ -431,10 +479,12 @@ def main():
         return
 
     out = resolve_out(args.out)
-    if os.path.isdir(out) or out.endswith(os.sep):
+    if is_dir_target(out):
         os.makedirs(out, exist_ok=True)
-        out = os.path.join(out, default_filename(chain))
+        out = unique_path(os.path.join(out, default_filename(chain)))
     else:
+        if os.path.exists(out) and not args.force:
+            sys.exit(f"error: {out} exists; pass --force to overwrite")
         parent = os.path.dirname(os.path.abspath(out))
         os.makedirs(parent, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

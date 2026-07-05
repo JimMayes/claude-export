@@ -63,6 +63,7 @@ python3 .claude/skills/export-session/scripts/export_session.py [options]
 | `--no-thinking` | omit thinking blocks |
 | `--max-result-lines N` | truncate each tool result to N lines |
 | `--stdout` | print instead of writing |
+| `--force` | overwrite an existing `--out` file |
 
 The script prints the absolute path of the written file, so workflows can
 capture it: `path=$(python3 .../export_session.py)`.

@@ -37,6 +37,8 @@ path back (or pass it on to the next step of a larger workflow).
 - `--max-result-lines N` — truncate each tool result to N lines (default:
   keep everything).
 - `--stdout` — print the transcript instead of writing a file.
+- `--force` — overwrite an existing `--out` file (refused otherwise;
+  auto-named exports never collide, they get a `-2`, `-3`, … suffix).
 
 ## Default destination
 
