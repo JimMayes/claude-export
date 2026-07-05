@@ -1,0 +1,6 @@
+# exported transcripts are personal — never commit them
+claude-sessions/
+*.txt
+
+# personal Claude Code settings
+.claude/settings.local.json

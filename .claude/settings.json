@@ -1,0 +1,5 @@
+{
+  "env": {
+    "CLAUDE_EXPORT_DIR": "claude-sessions"
+  }
+}
